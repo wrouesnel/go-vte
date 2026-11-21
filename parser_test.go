@@ -65,13 +65,43 @@ type testDispatcher struct {
 	dispatched []testSequence
 }
 
+// The parser's slices are only good during a call: a dispatcher keeping them copies them.
+func cloneParams(params [][]uint16) [][]uint16 {
+	if params == nil {
+		return nil
+	}
+	out := make([][]uint16, len(params))
+	for i, p := range params {
+		out[i] = append([]uint16{}, p...)
+	}
+	return out
+}
+
+func cloneBytes(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	return append([]byte{}, b...)
+}
+
+func cloneOscParams(params [][]byte) [][]byte {
+	if params == nil {
+		return nil
+	}
+	out := make([][]byte, len(params))
+	for i, p := range params {
+		out[i] = cloneBytes(p)
+	}
+	return out
+}
+
 var _ Performer = &testDispatcher{}
 
 // CsiDispatch implements Performer.
 func (d *testDispatcher) CsiDispatch(params [][]uint16, intermediates []byte, ignore bool, r rune) {
 	d.dispatched = append(d.dispatched, testCsiSequence{
-		params:        params,
-		intermediates: intermediates,
+		params:        cloneParams(params),
+		intermediates: cloneBytes(intermediates),
 		ignore:        ignore,
 		rune:          r,
 	})
@@ -80,7 +110,7 @@ func (d *testDispatcher) CsiDispatch(params [][]uint16, intermediates []byte, ig
 // EscDispatch implements Performer.
 func (d *testDispatcher) EscDispatch(intermediates []byte, ignore bool, b byte) {
 	d.dispatched = append(d.dispatched, testEscSequence{
-		intermediates: intermediates,
+		intermediates: cloneBytes(intermediates),
 		ignore:        ignore,
 		b:             b,
 	})
@@ -92,8 +122,8 @@ func (*testDispatcher) Execute(b byte) {}
 // Hook implements Performer.
 func (d *testDispatcher) Hook(params [][]uint16, intermediates []byte, ignore bool, r rune) {
 	d.dispatched = append(d.dispatched, testDcsHookSequence{
-		params:        params,
-		intermediates: intermediates,
+		params:        cloneParams(params),
+		intermediates: cloneBytes(intermediates),
 		ignore:        ignore,
 		rune:          r,
 	})
@@ -102,7 +132,7 @@ func (d *testDispatcher) Hook(params [][]uint16, intermediates []byte, ignore bo
 // OscDispatch implements Performer.
 func (d *testDispatcher) OscDispatch(params [][]byte, bellTerminated bool) {
 	d.dispatched = append(d.dispatched, testOscSequence{
-		params: params,
+		params: cloneOscParams(params),
 		bell:   bellTerminated,
 	})
 }
@@ -124,7 +154,7 @@ func (d *testDispatcher) Unhook() {
 func (d *testDispatcher) SosPmApcDispatch(kind SosPmApcKind, data []byte, bellTerminated bool) {
 	d.dispatched = append(d.dispatched, testSosPmApcSequence{
 		kind:           kind,
-		data:           data,
+		data:           cloneBytes(data),
 		bellTerminated: bellTerminated,
 	})
 }
@@ -190,5 +220,49 @@ func BenchmarkStateChanges(bm *testing.B) {
 				parser.Advance(b)
 			}
 		}
+	}
+}
+
+// countDispatcher looks at what it's given without keeping it.
+type countDispatcher struct{ n int }
+
+func (d *countDispatcher) CsiDispatch(params [][]uint16, intermediates []byte, _ bool, _ rune) {
+	d.n += len(params) + len(intermediates)
+}
+func (d *countDispatcher) EscDispatch(intermediates []byte, _ bool, _ byte) {
+	d.n += len(intermediates)
+}
+func (*countDispatcher) Execute(byte) {}
+func (d *countDispatcher) Hook(params [][]uint16, intermediates []byte, _ bool, _ rune) {
+	d.n += len(params) + len(intermediates)
+}
+func (d *countDispatcher) OscDispatch(params [][]byte, _ bool) { d.n += len(params) }
+func (*countDispatcher) Print(rune)                            {}
+func (*countDispatcher) Put(byte)                              {}
+func (*countDispatcher) Unhook()                               {}
+func (d *countDispatcher) SosPmApcDispatch(_ SosPmApcKind, data []byte, _ bool) {
+	d.n += len(data)
+}
+
+// TestParsingDoesntAllocate checks that once warm, parsing a terminal's usual output,
+// with control sequences in every line, allocates nothing.
+func TestParsingDoesntAllocate(t *testing.T) {
+	d := &countDispatcher{}
+	p := NewParser(d)
+	input := []byte("\x1b[1;31mred\x1b[0m \x1b[38;2;10;20;30mrgb\x1b[m\x1b[2;5H\x1b[?25l\x1b(0q\x1b(B" +
+		"\x1b]0;title\x07\x1b_apc\x1b\\\x1bP1$rq\x1b\\ text\r\n")
+	for _, b := range input {
+		p.Advance(b)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		for _, b := range input {
+			p.Advance(b)
+		}
+	})
+	if allocs != 0 {
+		t.Errorf("parsing allocated %v objects", allocs)
+	}
+	if d.n == 0 {
+		t.Error("nothing was dispatched")
 	}
 }

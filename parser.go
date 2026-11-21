@@ -18,9 +18,11 @@ const maxIntermediates = 2
 // maxOscRaw is the maximum number of bytes allowed in an osc parameter.
 const maxOscRaw = 1024
 
+// maxSosPmApcRaw is the most bytes of a SOS, PM or APC string kept: the rest is dropped.
+const maxSosPmApcRaw = 4096
+
 // maxOscParams is the maximum number of osc parameters allowed.
 const maxOscParams = 16
-
 
 // SosPmApcKind represents the type of SOS/PM/APC sequence.
 type SosPmApcKind = byte
@@ -60,7 +62,8 @@ type Performer interface {
 	// EscDispatch is called when an esc dispatch action is performed.
 	EscDispatch(intermediates []byte, ignore bool, b byte)
 
-	// SosPmApcDispatch is called when a SOS/PM/APC sequence is complete.
+	// SosPmApcDispatch is called when a SOS/PM/APC sequence is complete. The data is the
+	// parser's own, only good until it's given more input.
 	// kind indicates the type of sequence (SosKind, PmKind, or ApcKind).
 	// data contains the raw bytes of the sequence payload.
 	// bellTerminated is true if the sequence was terminated by BEL (0x07).
@@ -77,9 +80,12 @@ type Parser struct {
 	hasParam        bool
 	oscRaw          []byte
 	oscParams       [maxOscParams][2]int
-	oscNumParams    int
-	ignoring        bool
-	utf8Parser      *utf8.Parser
+	// paramsOut and oscOut hold what Params and OscParams return.
+	paramsOut    [maxParams][]uint16
+	oscOut       [maxOscParams][]byte
+	oscNumParams int
+	ignoring     bool
+	utf8Parser   *utf8.Parser
 
 	// SOS/PM/APC sequence state
 	sosPmApcKind SosPmApcKind
@@ -180,23 +186,35 @@ func (p *Parser) Advance(b byte) {
 	}
 }
 
-// Intermediates returns the intermediates
+// Intermediates returns the intermediates. The slice is the parser's own, only good
+// until it's given more input: a performer which keeps it must copy it.
 func (p *Parser) Intermediates() []byte {
-	return append([]byte{}, p.intermediates[:p.intermediateIdx]...)
+	return p.intermediates[:p.intermediateIdx:p.intermediateIdx]
 }
 
-// Params returns the params
+// Params returns the params. The slices are the parser's own, only good until it's given
+// more input: a performer which keeps them must copy them. Building them allocates
+// nothing, as parsing output with escape sequences in every line calls this constantly.
 func (p *Parser) Params() [][]uint16 {
-	var params [][]uint16
-	p.params.Range(func(param []uint16) {
-		params = append(params, param)
-	})
-	return params
+	out := p.paramsOut[:0]
+	for i := 0; i < p.params.len; {
+		n := int(p.params.subparams[i])
+		if n == 0 {
+			break
+		}
+		out = append(out, p.params.params[i:i+n:i+n])
+		i += n
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
-// OscParams returns the osc params
+// OscParams returns the osc params. The slices are the parser's own, only good until
+// it's given more input: a performer which keeps them must copy them.
 func (p *Parser) OscParams() [][]byte {
-	params := make([][]byte, 0, maxOscParams)
+	params := p.oscOut[:0]
 	rawLen := len(p.oscRaw)
 
 	for i := 0; i < p.oscNumParams; i++ {
@@ -306,7 +324,12 @@ func (p *Parser) performAction(action, b byte) {
 		p.putcb(b)
 
 	case OscStartAction:
-		p.oscRaw = make([]byte, 0)
+		// The buffer is made once and reused: OscParams' slices are only good during
+		// OscDispatch.
+		if p.oscRaw == nil {
+			p.oscRaw = make([]byte, 0, 64) //nolint:mnd // grows to maxOscRaw
+		}
+		p.oscRaw = p.oscRaw[:0]
 		p.oscNumParams = 0
 
 	case OscPutAction:
@@ -428,10 +451,17 @@ func (p *Parser) performAction(action, b byte) {
 		case '_': // 0x5F - APC
 			p.sosPmApcKind = ApcKind
 		}
-		p.sosPmApcRaw = make([]byte, 0, 4096)
+		// The buffer is made once and reused: the data is only good during
+		// SosPmApcDispatch.
+		if p.sosPmApcRaw == nil {
+			p.sosPmApcRaw = make([]byte, 0, 256) //nolint:mnd // grows to maxSosPmApcRaw
+		}
+		p.sosPmApcRaw = p.sosPmApcRaw[:0]
 
 	case SosPmApcPutAction:
-		p.sosPmApcRaw = append(p.sosPmApcRaw, b)
+		if len(p.sosPmApcRaw) < maxSosPmApcRaw {
+			p.sosPmApcRaw = append(p.sosPmApcRaw, b)
+		}
 
 	case SosPmApcEndAction:
 		p.sosPmApccb(p.sosPmApcKind, p.sosPmApcRaw, b == 0x07)
